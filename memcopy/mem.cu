@@ -189,8 +189,142 @@ mv3(int n, double *val, int *col, int *ptr, double *b, double *c){
     }
   }
 }
+__global__ void
+mv4(double *c, double *val, int *col, int *ptr, double *b, int n){
+  extern __shared__ double vals[];
 
+  int thread_id=blockDim.x * blockIdx.x + threadIdx.x;
+  int warp_id=thread_id/32;
+  int lane=thread_id&(32-1);
 
+  int row=warp_id;
+
+  if(row < n){
+    int row_start=ptr[row];
+    int row_end=ptr[row+1];
+
+    double sum=0.0;
+    for(int jj=row_start+lane; jj<row_end ;jj+=32){
+      sum+=val[jj]*b[col[jj]];
+    }
+    vals[threadIdx.x] = sum; 
+    vals[threadIdx.x] = sum = sum + vals[threadIdx.x + 16];
+    vals[threadIdx.x] = sum = sum + vals[threadIdx.x +   8];
+    vals[threadIdx.x] = sum = sum + vals[threadIdx.x +   4];
+    vals[threadIdx.x] = sum = sum + vals[threadIdx.x +   2];
+    sum = sum + vals[threadIdx.x+ 1];
+
+    if(lane==0){
+      c[row] += vals[threadIdx.x];
+    }
+  }
+
+}
+__global__ void
+spmv_crs_kernel(const int num_rows, 
+                        const int *ptr, 
+                        const int *indices, 
+                        const double *data, 
+                        const double *x, 
+                        double *y)
+{
+  extern __shared__ double vals[];
+
+  int thread_id = blockDim.x * blockIdx.x + threadIdx.x;
+  int warp_id = thread_id/32;
+  int lane = thread_id & (32 - 1);
+
+  int row = warp_id;
+  if(row<num_rows)
+  {
+    int row_start = ptr[row];
+    int row_end = ptr[row+1];
+
+    vals[threadIdx.x] = 0.0;
+
+    for(int jj = row_start+lane; jj<row_end; jj+=32)
+    { 
+      /* int2 const v = tex1Dfetch(texture_, indices[jj]); */
+      vals[threadIdx.x]+=data[jj] * x[indices[jj]];
+      /* vals[threadIdx.x]+=data[jj] * __hiloint2double(v.y, v.x); */
+    }
+    
+    if(lane <16)
+      vals[threadIdx.x] += vals[threadIdx.x +16];
+    if(lane<8)
+      vals[threadIdx.x] += vals[threadIdx.x + 8];
+    if(lane<4)
+      vals[threadIdx.x] += vals[threadIdx.x + 4];
+    if(lane<2)
+      vals[threadIdx.x] += vals[threadIdx.x + 2];
+    if(lane<1)
+      vals[threadIdx.x] += vals[threadIdx.x + 1];
+  
+    if(lane == 0){
+      y[row] += vals[threadIdx.x];
+    }
+  }
+
+}
+
+texture<int2, 1, cudaReadModeElementType> vec_tex;//Texture
+
+__global__ void crs_gemv(int n, double *out,          
+    double *mat, int *col, int *row){
+  int i, j;//for
+  int2 v;//vector
+  int THREAD=32;
+  __shared__ double share[32+16];
+
+  int rn = row[blockIdx.x + 1] - row[blockIdx.x];
+  int ro = row[blockIdx.x];
+
+  //init shared memory 
+  share[threadIdx.x] = 0.0;
+
+  //mat * vec
+  for(i=0; i<rn/THREAD; i++){
+    j = i * THREAD + threadIdx.x;
+
+    v = tex1Dfetch(vec_tex, col[ro+j]);
+
+    share[threadIdx.x] += mat[ro+j] * __hiloint2double(v.y, v.x);
+  }
+  __syncthreads();
+
+  //remaindar
+  if(threadIdx.x < rn%THREAD){
+    j = rn - (rn % THREAD) + threadIdx.x;
+
+    v = tex1Dfetch(vec_tex, col[ro+j]);
+
+    share[threadIdx.x] += mat[ro+j] * __hiloint2double(v.y, v.x);
+  }
+  __syncthreads();
+
+  //reduce
+  for(j=THREAD/2; j>31; j>>=1){
+    if(threadIdx.x < j)
+      share[threadIdx.x] += share[threadIdx.x + j];
+    __syncthreads();
+  }
+  if(threadIdx.x < 16){//(32/2)
+    share[threadIdx.x] += share[threadIdx.x + 16];
+    __syncthreads();
+    share[threadIdx.x] += share[threadIdx.x + 8];
+    __syncthreads();
+    share[threadIdx.x] += share[threadIdx.x + 4];
+    __syncthreads();
+    share[threadIdx.x] += share[threadIdx.x + 2];
+    __syncthreads();
+    share[threadIdx.x] += share[threadIdx.x + 1];
+  }
+  __syncthreads();
+
+  //return
+  if(threadIdx.x == 0)
+    out[blockIdx.x] = share[0];     
+}
 
 int main(int argc, char const* argv[])
 {
@@ -219,8 +353,8 @@ int main(int argc, char const* argv[])
 
   init_genrand((unsigned)time(NULL));
   double st, et;
-  double t1, t11, t2, t3, t4, t5, t6, t7;
-  double checksum1=0.0, checksum11=0.0, checksum2=0.0, checksum3=0.0, checksum4=0.0, checksum5=0.0, checksum6=0.0, checksum7=0.0;
+  double t1, t11, t2, t3, t4, t5;
+  double checksum1=0.0, checksum11=0.0, checksum2=0.0, checksum3=0.0, checksum4=0.0, checksum5=0.0;
   int ThreadPerBlock=1024;
   int BlockPerGrid=(N-1)/(ThreadPerBlock)+1;
 
@@ -228,7 +362,8 @@ int main(int argc, char const* argv[])
   GetData(argv[1], argv[2], argv[3], col, ptr, val, b, c, N, NNZ);
 
   for(i=0;i<N;i++){
-    b[i]=genrand_real3();
+    /* b[i]=genrand_real3(); */
+    b[i]=1.0;
     c[i]=0.0;
   }
 /*-----------------------------------------------------------------*/
@@ -245,7 +380,10 @@ int main(int argc, char const* argv[])
 
   for(i=0;i<N;i++){
     checksum1+=c[i];
+    c[i]=0.0;
   }
+  printf("checksum1  =\t%f\n",checksum1);
+  printf("CPU\ttime=\t\t\t%.12e\n",t1);
 /*-----------------------------------------------------------------*/
   omp_set_num_threads(8);
   st=gettimeofday_sec();
@@ -263,8 +401,10 @@ int main(int argc, char const* argv[])
 
   for(i=0;i<N;i++){
     checksum11+=c[i];
+    c[i]=0.0;
   }
-
+  printf("checksum1.1=\t%f\n",checksum11);
+  printf("CPU\t+OpenMP time=\t\t%.12e\n",t11);
 /*-----------------------------------------------------------------*/
 
   st=gettimeofday_sec();
@@ -279,8 +419,11 @@ int main(int argc, char const* argv[])
   et=gettimeofday_sec();
   for(i=0;i<N;i++){
     checksum2+=c[i];
+    c[i]=0.0;
   }
   t2=et-st;
+  printf("checksum2  =\t%f\n",checksum2);
+  printf("CUDA\t+origin time=\t\t%.12e\n",t2);
 
 /*-----------------------------------------------------------------*/
 
@@ -296,129 +439,75 @@ int main(int argc, char const* argv[])
   et=gettimeofday_sec();
   for(i=0;i<N;i++){
     checksum3+=c[i];
+    c[i]=0.0;
   }
   t3=et-st;
 
-/*-----------------------------------------------------------------*/
-
-  st=gettimeofday_sec();
-  cudaMemcpy(dcol, col, sizeof(int)*NNZ, cudaMemcpyHostToDevice);
-  cudaMemcpy(dval, val, sizeof(double)*NNZ, cudaMemcpyHostToDevice);
-  cudaMemcpy(dptr, ptr, sizeof(int)*(N+1), cudaMemcpyHostToDevice);
-  cudaMemcpy(db, b, sizeof(double)*N, cudaMemcpyHostToDevice);
-
-  mv3<<<BlockPerGrid, ThreadPerBlock>>>(N, dval, dcol, dptr, db, dc);
-
-  cudaMemcpy(c, dc, sizeof(double)*N, cudaMemcpyDeviceToHost);
-  et=gettimeofday_sec();
-  for(i=0;i<N;i++){
-    checksum4+=c[i];
-  }
-  t4=et-st;
-
-/*-----------------------------------------------------------------*/
-  cudaHostRegister(col, sizeof(int)*NNZ, cudaHostRegisterDefault);
-  cudaHostRegister(val, sizeof(double)*NNZ, cudaHostRegisterDefault);
-  cudaHostRegister(ptr, sizeof(int)*(N+1), cudaHostRegisterDefault);
-  cudaHostRegister(b, sizeof(double)*N, cudaHostRegisterDefault);
-  cudaHostRegister(c, sizeof(double)*NNZ, cudaHostRegisterDefault);
-
-  st=gettimeofday_sec();
-  cudaMemcpy(dcol, col, sizeof(int)*NNZ, cudaMemcpyHostToDevice);
-  cudaMemcpy(dval, val, sizeof(double)*NNZ, cudaMemcpyHostToDevice);
-  cudaMemcpy(dptr, ptr, sizeof(int)*(N+1), cudaMemcpyHostToDevice);
-  cudaMemcpy(db, b, sizeof(double)*N, cudaMemcpyHostToDevice);
-
-  mv3<<<BlockPerGrid, ThreadPerBlock>>>(N, dval, dcol, dptr, db, dc);
-
-  cudaMemcpy(c, dc, sizeof(double)*N, cudaMemcpyDeviceToHost);
-  et=gettimeofday_sec();
-  for(i=0;i<N;i++){
-    checksum5+=c[i];
-  }
-  t5=et-st;
-  cudaHostUnregister(col);
-  cudaHostUnregister(val);
-  cudaHostUnregister(ptr);
-  cudaHostUnregister(b);
-  cudaHostUnregister(c);
-/*-----------------------------------------------------------------*/
-  cudaHostRegister(col, sizeof(int)*NNZ, cudaHostRegisterMapped);
-  cudaHostRegister(val, sizeof(double)*NNZ, cudaHostRegisterMapped);
-  cudaHostRegister(ptr, sizeof(int)*(N+1), cudaHostRegisterMapped);
-  cudaHostRegister(b, sizeof(double)*N, cudaHostRegisterMapped);
-  cudaHostRegister(c, sizeof(double)*N, cudaHostRegisterMapped);
-
-  st=gettimeofday_sec();
-
-  cudaHostGetDevicePointer((void **)&dcol, col, 0);
-  cudaHostGetDevicePointer((void **)&dval, val, 0);
-  cudaHostGetDevicePointer((void **)&dptr, ptr, 0);
-  cudaHostGetDevicePointer((void **)&db, b, 0);
-  cudaHostGetDevicePointer((void **)&dc, c, 0);
-
-
-  mv3<<<BlockPerGrid, ThreadPerBlock>>>(N, dval, dcol, dptr, db, dc);
-
-  /* cudamemcpy(c, dc, sizeof(double)*n, cudamemcpydevicetohost); */
-  et=gettimeofday_sec();
-  for(i=0;i<N;i++){
-    checksum6+=c[i];
-  }
-  t6=et-st;
-  cudaHostUnregister(col);
-  cudaHostUnregister(val);
-  cudaHostUnregister(ptr);
-  cudaHostUnregister(b);
-  cudaHostUnregister(c);
-
-/*-----------------------------------------------------------------*/
-
-  double *val2, *b2, *c2;
-  int *col2, *ptr2;
-  cudaMallocManaged(&col2, sizeof(int)*NNZ);
-  cudaMallocManaged(&val2, sizeof(double)*NNZ);
-  cudaMallocManaged(&ptr2, sizeof(int)*(N+1));
-  cudaMallocManaged(&b2, sizeof(double)*N);
-  cudaMallocManaged(&c2, sizeof(double)*N);
-
-  st=gettimeofday_sec();
-
-  mv3<<<BlockPerGrid, ThreadPerBlock>>>(N, dval, dcol, dptr, db, dc);
-  cudaDeviceSynchronize();
-
-  et=gettimeofday_sec();
-
-  for(i=0;i<N;i++){
-    checksum7+=c[i];
-  }
-  t7=et-st;
-
-  cudaFree(col2);
-  cudaFree(val2);
-  cudaFree(ptr2);
-  cudaFree(b2);
-  cudaFree(c2);
-
-
-  printf("checksum1  =\t%f\n",checksum1);
-  printf("checksum1.1=\t%f\n",checksum11);
-  printf("checksum2  =\t%f\n",checksum2);
   printf("checksum3  =\t%f\n",checksum3);
-  printf("checksum4  =\t%f\n",checksum4);
-  printf("checksum5  =\t%f\n",checksum5);
-  printf("checksum6  =\t%f\n",checksum6);
-  printf("checksum7  =\t%f\n",checksum7);
-  printf("----------------------------------------------\n");
-  printf("CPU\ttime=\t\t\t%.12e\n",t1);
-  printf("CPU\t+OpenMP time=\t\t%.12e\n",t11);
-  printf("----------------------------------------------\n");
-  printf("CUDA\t+origin time=\t\t%.12e\n",t2);
   printf("CUDA\t+block  time=\t\t%.12e\n",t3);
-  printf("CUDA\t++shared memory time=\t%.12e\n",t4);
-  printf("CUDA\t++pinned memory time=\t%.12e\n",t5);
-  printf("CUDA\t++mapped memory time=\t%.12e\n",t6);
-  printf("CUDA\t++unified memory time=\t%.12e\n",t7);
+/*-----------------------------------------------------------------*/
+  /* ThreadPerBlock = 128;  */
+  /* BlockPerGrid=ceil((double)N/(double)ThreadPerBlock/32);  */
+  /*  */
+  /*  */
+  /* st=gettimeofday_sec(); */
+  /* cudaMemcpy(dcol, col, sizeof(int)*NNZ, cudaMemcpyHostToDevice); */
+  /* cudaMemcpy(dval, val, sizeof(double)*NNZ, cudaMemcpyHostToDevice); */
+  /* cudaMemcpy(dptr, ptr, sizeof(int)*(N+1), cudaMemcpyHostToDevice); */
+  /* cudaMemcpy(db, b, sizeof(double)*N, cudaMemcpyHostToDevice); */
+  /*  */
+  /* cudaBindTexture(NULL, vec_tex, db, sizeof(double) * N); */
+  /* crs_gemv<<<N, 32>>>(N, dc, dval, dcol, dptr); */
+  /* cudaUnbindTexture(vec_tex); */
+  /*  */
+  /* cudaMemcpy(c, dc, sizeof(double)*N, cudaMemcpyDeviceToHost); */
+  /*  */
+  /* et=gettimeofday_sec(); */
+  /* for(i=0;i<N;i++){ */
+  /*   checksum4+=c[i]; */
+  /*   c[i]=0.0; */
+  /* } */
+  /* t4=et-st; */
+  /* printf("checksum4  =\t%f\n",checksum4); */
+  /* printf("CUDA\t++shared memory time=\t%.12e\n",t4); */
+
+/*-----------------------------------------------------------------*/
+  /* cudaHostRegister(col, sizeof(int)*NNZ, cudaHostRegisterDefault); */
+  /* cudaHostRegister(val, sizeof(double)*NNZ, cudaHostRegisterDefault); */
+  /* cudaHostRegister(ptr, sizeof(int)*(N+1), cudaHostRegisterDefault); */
+  /* cudaHostRegister(b, sizeof(double)*N, cudaHostRegisterDefault); */
+  /* cudaHostRegister(c, sizeof(double)*NNZ, cudaHostRegisterDefault); */
+  /*  */
+  /* st=gettimeofday_sec(); */
+  /* cudaMemcpy(dcol, col, sizeof(int)*NNZ, cudaMemcpyHostToDevice); */
+  /* cudaMemcpy(dval, val, sizeof(double)*NNZ, cudaMemcpyHostToDevice); */
+  /* cudaMemcpy(dptr, ptr, sizeof(int)*(N+1), cudaMemcpyHostToDevice); */
+  /* cudaMemcpy(db, b, sizeof(double)*N, cudaMemcpyHostToDevice); */
+  /*  */
+  //mv3<<<BlockPerGrid, ThreadPerBlock>>>(N, dval, dcol, dptr, db, dc);
+  /* cudaBindTexture(NULL, vec_tex, db, sizeof(double) * N); */
+  /* crs_gemv<<<N, 128>>>(N, dc, dval, dcol, dptr); */
+  /* cudaUnbindTexture(vec_tex); */
+  /*  */
+  /* cudaMemcpy(c, dc, sizeof(double)*N, cudaMemcpyDeviceToHost); */
+  /* et=gettimeofday_sec(); */
+  /*  */
+  /* for(i=0;i<N;i++){ */
+  /*   checksum5+=c[i]; */
+  /*   c[i]=0.0; */
+  /* } */
+  /*  */
+  /* t5=et-st; */
+  /* cudaHostUnregister(col); */
+  /* cudaHostUnregister(val); */
+  /* cudaHostUnregister(ptr); */
+  /* cudaHostUnregister(b); */
+  /* cudaHostUnregister(c); */
+  /* printf("checksum5  =\t%f\n",checksum5); */
+  /* printf("CUDA\t++pinned memory time=\t%.12e\n",t5); */
+
+  printf("----------------------------------------------\n");
+  printf("----------------------------------------------\n");
 
 
   free(col);
