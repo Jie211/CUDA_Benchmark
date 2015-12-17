@@ -139,8 +139,8 @@ mv1(int n, double *val, int *col, int *ptr, double *b, double *c){
 }
 __global__ void
 mv2(int n, double *val, int *col, int *ptr, double *b, double *c){
-  int row=blockDim.x * blockIdx.x + threadIdx.x;
-  int i, j;
+  long int row=blockDim.x * blockIdx.x + threadIdx.x;
+  long int i, j;
   if(row<n){
     for(i=0;i<n;i++){
       double tmp=0.0;
@@ -382,10 +382,10 @@ int main(int argc, char const* argv[])
     checksum1+=c[i];
     c[i]=0.0;
   }
-  printf("checksum1  =\t%f\n",checksum1);
-  printf("CPU\ttime=\t\t\t%.12e\n",t1);
+  printf("checksum1  =%f\n",checksum1);
+  printf("CPU\ttime=%.12e\n",t1);
 /*-----------------------------------------------------------------*/
-  omp_set_num_threads(8);
+  omp_set_num_threads(4);
   st=gettimeofday_sec();
   double tmp_omp=0.0;
 #pragma omp parallel for private(j) reduction(+:tmp_omp) schedule(static) firstprivate(c, val, b) lastprivate(c)
@@ -403,8 +403,8 @@ int main(int argc, char const* argv[])
     checksum11+=c[i];
     c[i]=0.0;
   }
-  printf("checksum1.1=\t%f\n",checksum11);
-  printf("CPU\t+OpenMP time=\t\t%.12e\n",t11);
+  printf("checksum1.1=%f\n",checksum11);
+  printf("CPU\t+OpenMP time=%.12e\n",t11);
 /*-----------------------------------------------------------------*/
 
   st=gettimeofday_sec();
@@ -422,8 +422,8 @@ int main(int argc, char const* argv[])
     c[i]=0.0;
   }
   t2=et-st;
-  printf("checksum2  =\t%f\n",checksum2);
-  printf("CUDA\t+origin time=\t\t%.12e\n",t2);
+  printf("checksum2  =%f\n",checksum2);
+  printf("CUDA\t+origin time=%.12e\n",t2);
 
 /*-----------------------------------------------------------------*/
 
@@ -443,8 +443,8 @@ int main(int argc, char const* argv[])
   }
   t3=et-st;
 
-  printf("checksum3  =\t%f\n",checksum3);
-  printf("CUDA\t+block  time=\t\t%.12e\n",t3);
+  printf("checksum3  =%f\n",checksum3);
+  printf("CUDA\t+block  time=%.12e\n",t3);
 /*-----------------------------------------------------------------*/
   /* ThreadPerBlock = 128;  */
   /* BlockPerGrid=ceil((double)N/(double)ThreadPerBlock/32);  */

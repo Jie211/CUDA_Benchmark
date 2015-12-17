@@ -1,0 +1,21 @@
+!_TAG_FILE_FORMAT	2	/extended format; --format=1 will not append ;" to lines/
+!_TAG_FILE_SORTED	1	/0=unsorted, 1=sorted, 2=foldcase/
+!_TAG_PROGRAM_AUTHOR	Darren Hiebert	/dhiebert@users.sourceforge.net/
+!_TAG_PROGRAM_NAME	Exuberant Ctags	//
+!_TAG_PROGRAM_URL	http://ctags.sourceforge.net	/official site/
+!_TAG_PROGRAM_VERSION	5.8	//
+LOWER_MASK	MT.h	59;"	d
+MATRIX_A	MT.h	57;"	d
+MT_M	MT.h	56;"	d
+MT_N	MT.h	55;"	d
+UPPER_MASK	MT.h	58;"	d
+genrand_int31	MT.h	/^long genrand_int31(void)$/;"	f
+genrand_int32	MT.h	/^unsigned long genrand_int32(void)$/;"	f
+genrand_real1	MT.h	/^double genrand_real1(void)$/;"	f
+genrand_real2	MT.h	/^double genrand_real2(void)$/;"	f
+genrand_real3	MT.h	/^double genrand_real3(void)$/;"	f
+genrand_res53	MT.h	/^double genrand_res53(void) $/;"	f
+init_by_array	MT.h	/^void init_by_array(unsigned long init_key[], int key_length)$/;"	f
+init_genrand	MT.h	/^void init_genrand(unsigned long s)$/;"	f
+mt	MT.h	/^static unsigned long mt[MT_N]; \/* the array for the state vector  *\/$/;"	v
+mti	MT.h	/^static int mti=MT_N+1; \/* mti==MT_N+1 means mt[MT_N] is not initialized *\/$/;"	v
