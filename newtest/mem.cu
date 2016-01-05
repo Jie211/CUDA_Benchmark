@@ -8,6 +8,13 @@
 #include <helper_functions.h>
 #include "MT.h"
 
+texture<int2, 1, cudaReadModeElementType> vec_tex;
+
+__device__ __inline__ double shfl_xor(double val, int const lane)
+{
+  return __hiloint2double(__shfl_xor(__double2hiint(val),lane), __shfl_xor(__double2loint(val),lane));
+}
+
 void GetHead(const char *bx, const char *col, const char *ptr, int *n, int *nnz)
 {
   FILE *in1, *in2, *in3;
@@ -122,6 +129,8 @@ void GetData(const char *file1, const char *file2, const char *file3, int *col, 
   fclose(in2);
   fclose(in3);
 }
+
+
 double gettimeofday_sec()
 {
   struct timeval tv;
@@ -197,6 +206,143 @@ mv3(int n, double *val, int *col, int *ptr, double *b, double *c){
     }
   }
 }
+
+__global__ void
+mv4(int n, double *val, int *col, int *ptr, double *b, double *c){
+  /* extern __shared__ volatile double vals[]; */
+  extern __shared__ double vals[];
+
+  int thread_id = blockDim.x * blockIdx.x + threadIdx.x;
+  int warp_id = thread_id/32;
+  int lane = thread_id & (32 - 1);
+
+  int2 v;
+
+  int row = warp_id;
+  if(row<n)
+  {
+    int row_start = ptr[row];
+    int row_end = ptr[row+1];
+
+    vals[threadIdx.x] = 0.0;
+
+    for(int jj = row_start+lane; jj<row_end; jj+=32)
+    { 
+      v=tex1Dfetch(vec_tex, col[jj]);
+      /* vals[threadIdx.x]+=val[jj] * b[col[jj]]; */
+      vals[threadIdx.x]+=val[jj] * __hiloint2double(v.y, v.x);
+    }
+
+    if(lane <16)
+      vals[threadIdx.x] += vals[threadIdx.x +16];
+    if(lane<8)
+      vals[threadIdx.x] += vals[threadIdx.x + 8];
+    if(lane<4)
+      vals[threadIdx.x] += vals[threadIdx.x + 4];
+    if(lane<2)
+      vals[threadIdx.x] += vals[threadIdx.x + 2];
+    if(lane<1)
+      vals[threadIdx.x] += vals[threadIdx.x + 1];
+
+    if(lane == 0){
+      c[row] += vals[threadIdx.x];
+    }
+  }
+}
+
+__global__ void
+mv5(int n, double *val, int *col, int *ptr, double *b, double *c)
+{
+  long row=blockDim.x * blockIdx.x + threadIdx.x;
+  long int i;
+  int2 v;
+  if(row<n){
+    double tmp=0.0;
+    long int row_start=ptr[row];
+    long int row_end=ptr[row+1];
+    for(i=row_start;i<row_end;i++){
+      v=tex1Dfetch(vec_tex, col[i]);
+      /* tmp+=val[i]*b[col[i]]; */
+      tmp+=val[i]*__hiloint2double(v.y, v.x);
+    }
+    /* __syncthreads(); */
+    c[row]=tmp;
+    /* printf("%d %.12e\n", row, c[row]); */
+  }
+  /* __syncthreads(); */
+}
+
+__global__ void
+mv6(int n, double *val, int *col, int *ptr, const double * __restrict__ b, double *c){
+  /* extern __shared__ volatile double vals[]; */
+  extern __shared__ double vals[];
+
+  int thread_id = blockDim.x * blockIdx.x + threadIdx.x;
+  int warp_id = thread_id/32;
+  int lane = thread_id & (32 - 1);
+
+  int row = warp_id;
+  if(row<n)
+  {
+    int row_start = ptr[row];
+    int row_end = ptr[row+1];
+
+    vals[threadIdx.x] = 0.0;
+
+    for(int jj = row_start+lane; jj<row_end; jj+=32)
+    { 
+      vals[threadIdx.x]+=val[jj] * b[col[jj]];
+    }
+
+    if(lane <16)
+      vals[threadIdx.x] += vals[threadIdx.x +16];
+    if(lane<8)
+      vals[threadIdx.x] += vals[threadIdx.x + 8];
+    if(lane<4)
+      vals[threadIdx.x] += vals[threadIdx.x + 4];
+    if(lane<2)
+      vals[threadIdx.x] += vals[threadIdx.x + 2];
+    if(lane<1)
+      vals[threadIdx.x] += vals[threadIdx.x + 1];
+
+    if(lane == 0){
+      c[row] += vals[threadIdx.x];
+    }
+  }
+}
+
+__global__ void
+mv7(int n, double *val, int *col, int *ptr, const double * __restrict__ b, double *c){
+
+  int thread_id = blockDim.x * blockIdx.x + threadIdx.x;
+  int warp_id = thread_id/32;
+  int lane = thread_id & (32 - 1);
+
+  int row = warp_id;
+  if(row<n)
+  {
+    int row_start = ptr[row];
+    int row_end = ptr[row+1];
+
+    double sum=0.0;
+    for(int jj = row_start+lane; jj<row_end; jj+=32)
+    { 
+      sum+=val[jj] * b[col[jj]];
+    }
+
+    sum+=shfl_xor(sum, 16);
+    sum+=shfl_xor(sum, 8);
+    sum+=shfl_xor(sum, 4);
+    sum+=shfl_xor(sum, 2);
+    sum+=shfl_xor(sum, 1);
+
+    if(lane == 0){
+      c[row] += sum;
+    }
+  }
+}
+
+
 int main(int argc, char const* argv[])
 {
   int i, j, N, NNZ;
@@ -241,7 +387,7 @@ int main(int argc, char const* argv[])
     sum1+=c[i];
     c[i]=0.0;
   }
-  printf("sum1=%f,t1=%.12e\n",sum1,t1);
+  printf("sum1=%f,t1=%.12e:CPU\n",sum1,t1);
 
   //------------------------------------
   omp_set_num_threads(8);
@@ -264,7 +410,7 @@ int main(int argc, char const* argv[])
     sum2+=c[i];
     c[i]=0.0;
   }
-  printf("sum2=%f,t2=%.12e\n",sum2,t2);
+  printf("sum2=%f,t2=%.12e:OpenMP\n",sum2,t2);
   //------------------------------------
   checkCudaErrors( cudaMalloc((void **)&dval, sizeof(double)*NNZ) );
   checkCudaErrors( cudaMalloc((void **)&dcol, sizeof(int)*NNZ) );
@@ -294,7 +440,7 @@ int main(int argc, char const* argv[])
     sum3+=c[i];
     c[i]=0.0;
   }
-  printf("sum3=%f,t3=%.12e\n",sum3,t3);
+  printf("sum3=%f,t3=%.12e:mv1\n",sum3,t3);
 
 
    //------------------------------------
@@ -324,7 +470,7 @@ int main(int argc, char const* argv[])
     sum4+=c[i];
     c[i]=0.0;
   }
-  printf("sum4=%f,t4=%.12e\n",sum4,t4);
+  printf("sum4=%f,t4=%.12e:mv2\n",sum4,t4);
 
  
   //--------------------------------------
@@ -355,7 +501,7 @@ int main(int argc, char const* argv[])
     sum5+=c[i];
     c[i]=0.0;
   }
-  printf("sum5=%f,t5=%.12e\n",sum5,t5);
+  printf("sum5=%f,t5=%.12e:mv3\n",sum5,t5);
 
   //--------------------------------------------
   checkCudaErrors( cudaHostRegister(val, sizeof(double)*NNZ, cudaHostRegisterDefault) );
@@ -390,7 +536,7 @@ int main(int argc, char const* argv[])
     sum6+=c[i];
     c[i]=0.0;
   }
-  printf("sum6=%f,t6=%.12e\n",sum6,t6);
+  printf("sum6=%f,t6=%.12e:mv3+pinned memory\n",sum6,t6);
   
   checkCudaErrors( cudaHostUnregister(val) );
   checkCudaErrors( cudaHostUnregister(col) );
@@ -416,7 +562,7 @@ int main(int argc, char const* argv[])
 
   for(i=0;i<N;i++){
     b2[i]=b[i];
-    c2[i]=1.0;
+    c2[i]=0.0;
   }
 
   checkCudaErrors( cudaHostGetDevicePointer( (void **)&dval2, (void *)val2, 0) );
@@ -428,12 +574,6 @@ int main(int argc, char const* argv[])
   double st7, et7, t7, sum7=0.0;
   st7=gettimeofday_sec();
 
-  /* checkCudaErrors( cudaMemcpy(dval, val, sizeof(double)*NNZ, cudaMemcpyHostToDevice) ); */
-  /* checkCudaErrors( cudaMemcpy(dcol, col, sizeof(int)*NNZ, cudaMemcpyHostToDevice) ); */
-  /* checkCudaErrors( cudaMemcpy(dptr, ptr, sizeof(int)*(N+1), cudaMemcpyHostToDevice) ); */
-  /* checkCudaErrors( cudaMemcpy(db, b, sizeof(double)*N, cudaMemcpyHostToDevice) ); */
-  /* checkCudaErrors( cudaMemset(dc, 0, sizeof(double)*N) ); */
-  
   ThreadPerBlock=960;
   BlockPerGrid=(N-1)/(ThreadPerBlock/32)+1;
 
@@ -441,8 +581,7 @@ int main(int argc, char const* argv[])
 
   checkCudaErrors(cudaPeekAtLastError());
 
-
-  /* checkCudaErrors( cudaMemcpy(c, dc, sizeof(double)*N, cudaMemcpyDeviceToHost) ); */
+  checkCudaErrors(cudaThreadSynchronize());
 
   et7=gettimeofday_sec();
 
@@ -451,7 +590,7 @@ int main(int argc, char const* argv[])
     sum7+=c2[i];
     c[i]=0.0;
   }
-  printf("sum7=%f,t7=%.12e\n",sum7,t7);
+  printf("sum7=%f,t7=%.12e:mv3+mapped memory\n",sum7,t7);
   
   checkCudaErrors( cudaFreeHost(val2) );
   checkCudaErrors( cudaFreeHost(col2) );
@@ -459,13 +598,181 @@ int main(int argc, char const* argv[])
   checkCudaErrors( cudaFreeHost(b2) );
   checkCudaErrors( cudaFreeHost(c2) );
 
-  free(dval2);
-  free(dcol2);
-  free(dptr2);
-  free(db2);
-  free(dc2);
+  //------------------------------------------
+  double *val3, *b3, *c3;
+  int *col3, *ptr3;
+
+  checkCudaErrors( cudaMallocManaged((void **)&val3, sizeof(double)*NNZ) );
+  checkCudaErrors( cudaMallocManaged((void **)&col3, sizeof(int)*NNZ) );
+  checkCudaErrors( cudaMallocManaged((void **)&ptr3, sizeof(int)*(N+1)) );
+  checkCudaErrors( cudaMallocManaged((void **)&b3, sizeof(double)*N)  );
+  checkCudaErrors( cudaMallocManaged((void **)&c3, sizeof(double)*N)  );
 
 
+  GetData(argv[1], argv[2], argv[3], col3, ptr3, val3, b3, c3, N, NNZ);
+
+  for(i=0;i<N;i++){
+    b3[i]=b[i];
+    c3[i]=0.0;
+  }
+
+  double st8, et8, t8, sum8=0.0;
+  st8=gettimeofday_sec();
+
+  ThreadPerBlock=960;
+  BlockPerGrid=(N-1)/(ThreadPerBlock/32)+1;
+  /* BlockPerGrid=(N-1)/(ThreadPerBlock)+1; */
+
+  mv3<<<BlockPerGrid, ThreadPerBlock, sizeof(double)*(ThreadPerBlock+16)>>>(N, val3, col3, ptr3, b3, c3);
+
+  /* mv2<<<BlockPerGrid, ThreadPerBlock>>>(N, val3, col3, ptr3, b3, c3); */
+
+  checkCudaErrors(cudaPeekAtLastError());
+
+  checkCudaErrors(cudaDeviceSynchronize());
+
+  et8=gettimeofday_sec();
+
+  t8=et8-st8;
+  for(i=0;i<N;i++){
+    sum8+=c3[i];
+    /* c[i]=0.0; */
+  }
+  printf("sum8=%f,t8=%.12e:mv3+unifield memory\n",sum8,t8);
+
+
+  checkCudaErrors( cudaFree(val3) );
+  checkCudaErrors( cudaFree(col3) );
+  checkCudaErrors( cudaFree(ptr3) );
+  checkCudaErrors( cudaFree(b3) );
+  checkCudaErrors( cudaFree(c3) );
+
+
+//--------------------------------------
+
+  
+  double st9, et9, t9, sum9=0.0;
+  st9=gettimeofday_sec();
+  checkCudaErrors( cudaMemcpy(dval, val, sizeof(double)*NNZ, cudaMemcpyHostToDevice) );
+  checkCudaErrors( cudaMemcpy(dcol, col, sizeof(int)*NNZ, cudaMemcpyHostToDevice) );
+  checkCudaErrors( cudaMemcpy(dptr, ptr, sizeof(int)*(N+1), cudaMemcpyHostToDevice) );
+  checkCudaErrors( cudaMemcpy(db, b, sizeof(double)*N, cudaMemcpyHostToDevice) );
+  checkCudaErrors( cudaMemset(dc, 0, sizeof(double)*N) );
+  
+  ThreadPerBlock=960;
+  /* BlockPerGrid=ceil((double)N/(double)ThreadPerBlock); */
+  /* BlockPerGrid=N; */
+  BlockPerGrid=(N-1)/(ThreadPerBlock/32)+1;
+
+  checkCudaErrors( cudaBindTexture(NULL, vec_tex, db, sizeof(double)*N) );
+  mv4<<<BlockPerGrid, ThreadPerBlock, sizeof(double)*(ThreadPerBlock+16)>>>(N, dval, dcol, dptr, db, dc);
+  checkCudaErrors( cudaUnbindTexture(vec_tex) );
+
+  checkCudaErrors(cudaPeekAtLastError());
+
+  checkCudaErrors( cudaMemcpy(c, dc, sizeof(double)*N, cudaMemcpyDeviceToHost) );
+
+  et9=gettimeofday_sec();
+
+  t9=et9-st9;
+  for(i=0;i<N;i++){
+    sum9+=c[i];
+    c[i]=0.0;
+  }
+  printf("sum9=%f,t9=%.12e:mv3+texture memory\n",sum9,t9);
+//--------------------------------------
+
+  
+  double st10, et10, t10, sum10=0.0;
+  st10=gettimeofday_sec();
+  checkCudaErrors( cudaMemcpy(dval, val, sizeof(double)*NNZ, cudaMemcpyHostToDevice) );
+  checkCudaErrors( cudaMemcpy(dcol, col, sizeof(int)*NNZ, cudaMemcpyHostToDevice) );
+  checkCudaErrors( cudaMemcpy(dptr, ptr, sizeof(int)*(N+1), cudaMemcpyHostToDevice) );
+  checkCudaErrors( cudaMemcpy(db, b, sizeof(double)*N, cudaMemcpyHostToDevice) );
+  checkCudaErrors( cudaMemset(dc, 0, sizeof(double)*N) );
+  
+  ThreadPerBlock=960;
+  BlockPerGrid=ceil((double)N/(double)ThreadPerBlock);
+  /* BlockPerGrid=N; */
+  /* BlockPerGrid=(N-1)/(ThreadPerBlock/32)+1; */
+
+  checkCudaErrors( cudaBindTexture(NULL, vec_tex, db, sizeof(double)*N) );
+  mv5<<<BlockPerGrid, ThreadPerBlock, sizeof(double)*(ThreadPerBlock+16)>>>(N, dval, dcol, dptr, db, dc);
+  checkCudaErrors( cudaUnbindTexture(vec_tex) );
+
+  checkCudaErrors(cudaPeekAtLastError());
+
+  checkCudaErrors( cudaMemcpy(c, dc, sizeof(double)*N, cudaMemcpyDeviceToHost) );
+
+  et10=gettimeofday_sec();
+
+  t10=et10-st10;
+  for(i=0;i<N;i++){
+    sum10+=c[i];
+    c[i]=0.0;
+  }
+  printf("sum10=%f,t10=%.12e:mv2+texture memory\n",sum10,t10);
+
+  //--------------------------------------
+  double st11, et11, t11, sum11=0.0;
+  st11=gettimeofday_sec();
+  checkCudaErrors( cudaMemcpy(dval, val, sizeof(double)*NNZ, cudaMemcpyHostToDevice) );
+  checkCudaErrors( cudaMemcpy(dcol, col, sizeof(int)*NNZ, cudaMemcpyHostToDevice) );
+  checkCudaErrors( cudaMemcpy(dptr, ptr, sizeof(int)*(N+1), cudaMemcpyHostToDevice) );
+  checkCudaErrors( cudaMemcpy(db, b, sizeof(double)*N, cudaMemcpyHostToDevice) );
+  checkCudaErrors( cudaMemset(dc, 0, sizeof(double)*N) );
+  
+  ThreadPerBlock=128;
+  /* BlockPerGrid=ceil((double)N/(double)ThreadPerBlock); */
+  /* BlockPerGrid=N; */
+  BlockPerGrid=(N-1)/(ThreadPerBlock/32)+1;
+
+  mv6<<<BlockPerGrid, ThreadPerBlock, sizeof(double)*(ThreadPerBlock+16)>>>(N, dval, dcol, dptr, db, dc);
+
+  checkCudaErrors(cudaPeekAtLastError());
+
+  checkCudaErrors( cudaMemcpy(c, dc, sizeof(double)*N, cudaMemcpyDeviceToHost) );
+
+  et11=gettimeofday_sec();
+
+  t11=et11-st11;
+
+  for(i=0;i<N;i++){
+    sum11+=c[i];
+    c[i]=0.0;
+  }
+  printf("sum11=%f,t11=%.12e:mv3+readonly memory\n",sum11,t11);
+
+
+  //--------------------------------------
+  
+  double st12, et12, t12, sum12=0.0;
+  st12=gettimeofday_sec();
+  checkCudaErrors( cudaMemcpy(dval, val, sizeof(double)*NNZ, cudaMemcpyHostToDevice) );
+  checkCudaErrors( cudaMemcpy(dcol, col, sizeof(int)*NNZ, cudaMemcpyHostToDevice) );
+  checkCudaErrors( cudaMemcpy(dptr, ptr, sizeof(int)*(N+1), cudaMemcpyHostToDevice) );
+  checkCudaErrors( cudaMemcpy(db, b, sizeof(double)*N, cudaMemcpyHostToDevice) );
+  checkCudaErrors( cudaMemset(dc, 0, sizeof(double)*N) );
+  
+  ThreadPerBlock=128;
+  /* BlockPerGrid=ceil((double)N/(double)ThreadPerBlock); */
+  /* BlockPerGrid=N; */
+  BlockPerGrid=(N-1)/(ThreadPerBlock/32)+1;
+
+  mv7<<<BlockPerGrid, ThreadPerBlock>>>(N, dval, dcol, dptr, db, dc);
+
+  checkCudaErrors(cudaPeekAtLastError());
+
+  checkCudaErrors( cudaMemcpy(c, dc, sizeof(double)*N, cudaMemcpyDeviceToHost) );
+
+  et12=gettimeofday_sec();
+
+  t12=et12-st12;
+  for(i=0;i<N;i++){
+    sum12+=c[i];
+    c[i]=0.0;
+  }
+  printf("sum12=%f,t12=%.12e:mv3-shared memory+readonly memory+warp_shuffle\n",sum12,t12);
 
 
   checkCudaErrors( cudaFree(dval) );
@@ -474,19 +781,6 @@ int main(int argc, char const* argv[])
   checkCudaErrors( cudaFree(db) );
   checkCudaErrors( cudaFree(dc) );
 
-
-  free(dval);
-  free(dcol);
-  free(dptr);
-  free(b);
-  free(c);
-
-
-  /* checkCudaErrors( cudaFree(dval) ); */
-  /* checkCudaErrors( cudaFree(dcol) ); */
-  /* checkCudaErrors( cudaFree(dptr) ); */
-  /* checkCudaErrors( cudaFree(db) ); */
-  /* checkCudaErrors( cudaFree(dc) ); */
 
 
 
